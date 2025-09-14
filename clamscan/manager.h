@@ -24,6 +24,11 @@
 
 #include "optparser.h"
 
+
+// Forward declaration - the actual type will be resolved when clamav.h is included
+struct cl_engine;
+
 int scanmanager(const struct optstruct *opts);
+int scanmanager_with_engine(const struct optstruct *opts, struct cl_engine *provided_engine);
 
 #endif

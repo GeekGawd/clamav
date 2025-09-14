@@ -1194,11 +1194,17 @@ static int scan_files(struct cl_engine *engine, const struct optstruct *opts, st
 
 int scanmanager(const struct optstruct *opts)
 {
+    return scanmanager_with_engine(opts, NULL);
+}
+
+int scanmanager_with_engine(const struct optstruct *opts, struct cl_engine *provided_engine)
+{
     int ret = 0;
     int i;
     struct cl_scan_options options;
     unsigned int dboptions = 0, dirlnk = 1, filelnk = 1;
-    struct cl_engine *engine = NULL;
+    struct cl_engine *engine = provided_engine;
+    int engine_created = 0;
     STATBUF sb;
     char *pua_cats = NULL;
     const struct optstruct *opt;
@@ -1253,16 +1259,20 @@ int scanmanager(const struct optstruct *opts)
     if (optget(opts, "bytecode")->enabled)
         dboptions |= CL_DB_BYTECODE;
 
-    if ((ret = cl_init(CL_INIT_DEFAULT))) {
-        logg(LOGG_ERROR, "Can't initialize libclamav: %s\n", cl_strerror(ret));
-        ret = 2;
-        goto done;
-    }
+    // Only initialize and load if engine not provided
+    if (!engine) {
+        if ((ret = cl_init(CL_INIT_DEFAULT))) {
+            logg(LOGG_ERROR, "Can't initialize libclamav: %s\n", cl_strerror(ret));
+            ret = 2;
+            goto done;
+        }
 
-    if (!(engine = cl_engine_new())) {
-        logg(LOGG_ERROR, "Can't initialize antivirus engine\n");
-        ret = 2;
-        goto done;
+        if (!(engine = cl_engine_new())) {
+            logg(LOGG_ERROR, "Can't initialize antivirus engine\n");
+            ret = 2;
+            goto done;
+        }
+        engine_created = 1;
     }
 
     cl_engine_set_clcb_virus_found(engine, clamscan_virus_found_cb);
@@ -1454,75 +1464,81 @@ int scanmanager(const struct optstruct *opts)
         }
     }
 
-    if ((opt = optget(opts, "database"))->active) {
-        while (opt) {
-            if (optget(opts, "fail-if-cvd-older-than")->enabled) {
-                if (LSTAT(opt->strarg, &sb) == -1) {
-                    logg(LOGG_ERROR, "Can't access database directory/file: %s\n", opt->strarg);
+    // Only load signatures if engine not provided
+    if (engine_created) {
+        if ((opt = optget(opts, "database"))->active) {
+            while (opt) {
+                if (optget(opts, "fail-if-cvd-older-than")->enabled) {
+                    if (LSTAT(opt->strarg, &sb) == -1) {
+                        logg(LOGG_ERROR, "Can't access database directory/file: %s\n", opt->strarg);
+                        ret = 2;
+                        goto done;
+                    }
+                    if (!S_ISDIR(sb.st_mode) && !CLI_DBEXT_SIGNATURE(opt->strarg)) {
+                        opt = opt->nextarg;
+                        continue;
+                    }
+                    if (check_if_cvd_outdated(opt->strarg, optget(opts, "fail-if-cvd-older-than")->numarg) != CL_SUCCESS) {
+                        ret = 2;
+                        goto done;
+                    }
+                }
+
+                if ((ret = cl_load(opt->strarg, engine, &info.sigs, dboptions))) {
+                    logg(LOGG_ERROR, "%s\n", cl_strerror(ret));
+
                     ret = 2;
                     goto done;
                 }
-                if (!S_ISDIR(sb.st_mode) && !CLI_DBEXT_SIGNATURE(opt->strarg)) {
-                    opt = opt->nextarg;
-                    continue;
-                }
-                if (check_if_cvd_outdated(opt->strarg, optget(opts, "fail-if-cvd-older-than")->numarg) != CL_SUCCESS) {
+
+                opt = opt->nextarg;
+            }
+        } else {
+            char *dbdir = freshdbdir();
+
+            if (optget(opts, "fail-if-cvd-older-than")->enabled) {
+                if (check_if_cvd_outdated(dbdir, optget(opts, "fail-if-cvd-older-than")->numarg) != CL_SUCCESS) {
                     ret = 2;
                     goto done;
                 }
             }
 
-            if ((ret = cl_load(opt->strarg, engine, &info.sigs, dboptions))) {
+            if ((ret = cl_load(dbdir, engine, &info.sigs, dboptions))) {
                 logg(LOGG_ERROR, "%s\n", cl_strerror(ret));
 
+                free(dbdir);
                 ret = 2;
                 goto done;
             }
-
-            opt = opt->nextarg;
-        }
-    } else {
-        char *dbdir = freshdbdir();
-
-        if (optget(opts, "fail-if-cvd-older-than")->enabled) {
-            if (check_if_cvd_outdated(dbdir, optget(opts, "fail-if-cvd-older-than")->numarg) != CL_SUCCESS) {
-                ret = 2;
-                goto done;
-            }
-        }
-
-        if ((ret = cl_load(dbdir, engine, &info.sigs, dboptions))) {
-            logg(LOGG_ERROR, "%s\n", cl_strerror(ret));
 
             free(dbdir);
-            ret = 2;
-            goto done;
-        }
-
-        free(dbdir);
-    }
-
-    /* pcre engine limits - required for cl_engine_compile */
-    if ((opt = optget(opts, "pcre-match-limit"))->active) {
-        if ((ret = cl_engine_set_num(engine, CL_ENGINE_PCRE_MATCH_LIMIT, opt->numarg))) {
-            logg(LOGG_ERROR, "cli_engine_set_num(CL_ENGINE_PCRE_MATCH_LIMIT) failed: %s\n", cl_strerror(ret));
-            ret = 2;
-            goto done;
         }
     }
 
-    if ((opt = optget(opts, "pcre-recmatch-limit"))->active) {
-        if ((ret = cl_engine_set_num(engine, CL_ENGINE_PCRE_RECMATCH_LIMIT, opt->numarg))) {
-            logg(LOGG_ERROR, "cli_engine_set_num(CL_ENGINE_PCRE_RECMATCH_LIMIT) failed: %s\n", cl_strerror(ret));
+    // Only compile engine if it was created by us and configure PCRE limits
+    if (engine_created) {
+        /* pcre engine limits - required for cl_engine_compile */
+        if ((opt = optget(opts, "pcre-match-limit"))->active) {
+            if ((ret = cl_engine_set_num(engine, CL_ENGINE_PCRE_MATCH_LIMIT, opt->numarg))) {
+                logg(LOGG_ERROR, "cli_engine_set_num(CL_ENGINE_PCRE_MATCH_LIMIT) failed: %s\n", cl_strerror(ret));
+                ret = 2;
+                goto done;
+            }
+        }
+
+        if ((opt = optget(opts, "pcre-recmatch-limit"))->active) {
+            if ((ret = cl_engine_set_num(engine, CL_ENGINE_PCRE_RECMATCH_LIMIT, opt->numarg))) {
+                logg(LOGG_ERROR, "cli_engine_set_num(CL_ENGINE_PCRE_RECMATCH_LIMIT) failed: %s\n", cl_strerror(ret));
+                ret = 2;
+                goto done;
+            }
+        }
+
+        if ((ret = cl_engine_compile(engine)) != 0) {
+            logg(LOGG_ERROR, "Database initialization error: %s\n", cl_strerror(ret));
             ret = 2;
             goto done;
         }
-    }
-
-    if ((ret = cl_engine_compile(engine)) != 0) {
-        logg(LOGG_ERROR, "Database initialization error: %s\n", cl_strerror(ret));
-        ret = 2;
-        goto done;
     }
 
     if (isatty(fileno(stdout)) &&
@@ -1893,8 +1909,10 @@ int scanmanager(const struct optstruct *opts)
     }
 
 done:
-    /* free the engine */
-    cl_engine_free(engine);
+    /* free the engine only if we created it */
+    if (engine_created) {
+        cl_engine_free(engine);
+    }
 
     /* overwrite return code - infection takes priority */
     if (info.ifiles)
